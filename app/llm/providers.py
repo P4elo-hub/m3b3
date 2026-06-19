@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from openai import AsyncOpenAI
+
 from app.config import Settings
 
 ProviderKind = Literal["primary", "fallback"]
@@ -68,4 +70,20 @@ def resolve_llm_credentials(
         base_url=base_url,
         model=settings.fallback_model,
         backend="ollama",
+    )
+
+
+def create_async_openai_client(
+    settings: Settings,
+    creds: LlmCredentials,
+    *,
+    timeout: float | None = None,
+    max_retries: int | None = None,
+) -> AsyncOpenAI:
+    """OpenAI-compatible AsyncOpenAI для primary / Ollama / DeepSeek."""
+    return AsyncOpenAI(
+        api_key=creds.api_key,
+        base_url=creds.base_url,
+        timeout=timeout if timeout is not None else settings.llm_sdk_timeout,
+        max_retries=max_retries if max_retries is not None else settings.llm_max_retries,
     )

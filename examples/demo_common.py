@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 EXAMPLES_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = EXAMPLES_DIR.parent
 ANSWERS_DIR = EXAMPLES_DIR / "answers"
 FEATURE_SLUG = "transfer-notifications-kafka"
 FEATURE_NAME = "Асинхронная отправка уведомлений по переводам"
@@ -94,3 +98,50 @@ def save_answer(result: dict[str, object], *, suffix: str = "") -> Path:
     output_path = ANSWERS_DIR / f"{slug}_{timestamp}.md"
     output_path.write_text(normalize_markdown_answer(str(result["answer"])), encoding="utf-8")
     return output_path
+
+
+def ensure_project_imports() -> None:
+    """Гарантирует импорт app из корня m3_b3, а не из другого venv/пакета."""
+    root = str(PROJECT_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+def ensure_async_tool_call_client() -> None:
+    """Проверяет, что установлен async ToolCallClient из текущего проекта m3_b3."""
+    ensure_project_imports()
+    from app.llm import ToolCallClient
+    import app.llm.client as client_module
+
+    expected_root = PROJECT_ROOT.resolve()
+    module_path = Path(client_module.__file__).resolve()
+    if expected_root not in module_path.parents:
+        print(
+            "Ошибка: загружен ToolCallClient из другой папки проекта.\n"
+            f"  ожидали: {expected_root / 'app' / 'llm' / 'client.py'}\n"
+            f"  получили: {module_path}\n"
+            f"  python:   {sys.executable}\n"
+            "Скорее всего .venv скопирован из m3_b1. Исправление:\n"
+            f"  cd {PROJECT_ROOT}\n"
+            "  python3 -m venv .venv\n"
+            "  source .venv/bin/activate\n"
+            "  pip install -e \".[dev]\"\n"
+            "  python examples/run_tool_call.py",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    if not inspect.iscoroutinefunction(ToolCallClient.chat_sectioned_json):
+        print(
+            "Ошибка: ToolCallClient не async (устаревший client.py).\n"
+            f"  module: {module_path}\n"
+            f"  python: {sys.executable}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+async def close_client(client: Any) -> None:
+    close = getattr(client, "aclose", None)
+    if close is not None:
+        await close()

@@ -16,10 +16,11 @@ from openai import (
 from app.config import Settings
 from app.llm import ToolCallClient
 from app.llm.providers import FallbackBackend
-from demo_common import FEATURE_BRIEF, FEATURE_NAME, FEATURE_PROTOCOL, save_answer
+from demo_common import FEATURE_BRIEF, FEATURE_NAME, FEATURE_PROTOCOL, close_client, ensure_async_tool_call_client, save_answer
 
 
-def run_sectioned_fallback_demo(*, backend: FallbackBackend, answer_suffix: str) -> int:
+async def run_sectioned_fallback_demo(*, backend: FallbackBackend, answer_suffix: str) -> int:
+    ensure_async_tool_call_client()
     settings = Settings()
     client = ToolCallClient(provider="fallback", fallback_backend=backend)
     backend_label = "Ollama (локально)" if backend == "ollama" else "DeepSeek API"
@@ -56,11 +57,15 @@ def run_sectioned_fallback_demo(*, backend: FallbackBackend, answer_suffix: str)
         "---"
     )
 
-    result = client.chat_sectioned_json(
-        FEATURE_BRIEF,
-        feature_name=FEATURE_NAME,
-        protocol=FEATURE_PROTOCOL,
-    )
+    try:
+        result = await client.chat_sectioned_json(
+            FEATURE_BRIEF,
+            feature_name=FEATURE_NAME,
+            protocol=FEATURE_PROTOCOL,
+        )
+    finally:
+        await close_client(client)
+
     output_path = save_answer(result, suffix=answer_suffix)
 
     print(f"Kit-tools (секций): {result['tool_calls_made']} | Модель: {result['model']}")
@@ -76,7 +81,7 @@ def handle_fallback_demo_errors(error: BaseException, *, backend: str) -> int:
     if isinstance(error, AuthenticationError):
         if backend == "deepseek":
             print(
-                "DeepSeek отклонил API-ключ. Проверьте DEEPSEEK_API_KEY в .env "
+                "DeepSeek отклонил API-key. Проверьте DEEPSEEK_API_KEY в .env "
                 "и баланс на platform.deepseek.com.",
                 file=sys.stderr,
             )

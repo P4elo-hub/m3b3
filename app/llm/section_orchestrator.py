@@ -1,4 +1,4 @@
-"""Пошаговая генерация документа: kit-tool → секция → склейка."""
+"""Пошаговая async-генерация документа: kit-tool → секция → склейка."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def _extract_title(feature_name: str | None, first_section: str, brief: str) -> 
 
 
 class SectionOrchestrator:
-    """Оркестратор: каждый kit-tool → отдельный LLM-вызов → склейка."""
+    """Async-оркестратор: каждый kit-tool → отдельный LLM-вызов → склейка."""
 
     def __init__(self, client: ToolCallClient) -> None:
         self._client = client
@@ -69,7 +69,7 @@ class SectionOrchestrator:
             service_name=client.settings.service_name,
         )
 
-    def generate(
+    async def generate(
         self,
         feature_brief: str,
         *,
@@ -87,6 +87,7 @@ class SectionOrchestrator:
         context_summary = ""
         section_outputs: list[str] = []
         tool_calls_made = 0
+        active_model = self._client._model
 
         for index, step in enumerate(plan):
             print(
@@ -105,7 +106,8 @@ class SectionOrchestrator:
             )
             tool_calls_made += 1
 
-            section_text = self._generate_section_markdown(package, step.label)
+            section_text, used_model = await self._generate_section_markdown(package, step.label)
+            active_model = used_model
             section_text = _normalize_section_text(section_text)
             section_outputs.append(section_text)
             context_summary = _update_context_summary(context_summary, section_text)
@@ -121,12 +123,11 @@ class SectionOrchestrator:
         return ChatResult(
             text=final_document,
             tool_calls_made=tool_calls_made,
-            model=self._client._model,
+            model=active_model,
         )
 
-    def _generate_section_markdown(self, kit_package: str, step_label: str) -> str:
-        response = self._client._client.chat.completions.create(
-            model=self._client._model,
+    async def _generate_section_markdown(self, kit_package: str, step_label: str) -> tuple[str, str]:
+        response = await self._client._create_completion(
             messages=[
                 {"role": "system", "content": self._system_prompt},
                 {
@@ -137,8 +138,7 @@ class SectionOrchestrator:
                     ),
                 },
             ],
-            temperature=0.2,
-            timeout=self._client.settings.request_timeout_seconds,
         )
         content = response.choices[0].message.content or ""
-        return content.strip()
+        model = response.model or self._client._model
+        return content.strip(), model

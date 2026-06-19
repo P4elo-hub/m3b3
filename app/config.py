@@ -60,3 +60,10 @@ class Settings(BaseSettings):
         default=PROJECT_ROOT / "feature-methodology-project" / "shablon.md",
         validation_alias="SUPPORT_SHABLON_PATH",
     )
+
+    # Async LLM client (FastAPI / benchmark)
+    llm_concurrency: int = Field(default=5, validation_alias="LLM_CONCURRENCY")
+    llm_sdk_timeout: float = Field(default=30.0, validation_alias="LLM_SDK_TIMEOUT")
+    llm_business_timeout: float = Field(default=15.0, validation_alias="LLM_BUSINESS_TIMEOUT")
+    llm_max_retries: int = Field(default=3, validation_alias="LLM_MAX_RETRIES")
+    llm_max_tokens: int = Field(default=512, validation_alias="LLM_MAX_TOKENS")

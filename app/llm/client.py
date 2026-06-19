@@ -1,17 +1,31 @@
-"""LLM client with full tool_call cycle."""
+"""Единый async LLM-клиент: tool calling, sectioned docs, batch, stream."""
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 from app.config import Settings
-from app.llm.providers import FallbackBackend, resolve_llm_credentials
+from app.llm.providers import (
+    FallbackBackend,
+    LlmCredentials,
+    ProviderKind,
+    create_async_openai_client,
+    resolve_llm_credentials,
+)
 from app.llm.text_tool_calls import parse_text_tool_calls
 from app.prompts.loader import build_system_prompt
 from app.tools import ToolHandlers, get_openai_tools
+
+logger = logging.getLogger(__name__)
+
+# Retry: встроенный max_retries SDK (429/5xx, exponential backoff, retry-after).
 
 
 @dataclass
@@ -34,26 +48,57 @@ class _ParsedToolCall:
 
 
 class ToolCallClient:
-    """Ассистент: system prompt из шаблона + цикл tool_call → handler → ответ."""
+    """Async-клиент DocIntel: tools, sectioned docs, complete, batch_chat, stream_chat."""
 
     def __init__(
         self,
         settings: Settings | None = None,
         *,
-        provider: Literal["primary", "fallback"] = "primary",
+        provider: ProviderKind = "primary",
         fallback_backend: FallbackBackend | None = None,
+        concurrency: int | None = None,
+        enable_fallback: bool = True,
+        max_tokens: int | None = None,
+        business_timeout: float | None = None,
     ) -> None:
         self.settings = settings or Settings()
         self.provider = provider
+        self._fallback_backend = fallback_backend
+        self._enable_fallback = enable_fallback
+        self._max_tokens = max_tokens if max_tokens is not None else self.settings.llm_max_tokens
+        self._business_timeout = (
+            business_timeout if business_timeout is not None else self.settings.llm_business_timeout
+        )
+        self._concurrency = (
+            concurrency if concurrency is not None else self.settings.llm_concurrency
+        )
+        self._sem = asyncio.Semaphore(self._concurrency)
 
-        credentials = resolve_llm_credentials(
+        self._credentials = resolve_llm_credentials(
             self.settings,
             provider,
             fallback_backend=fallback_backend,
         )
-        self._backend = credentials.backend
-        self._model = credentials.model
-        self._client = OpenAI(api_key=credentials.api_key, base_url=credentials.base_url)
+        self._backend = self._credentials.backend
+        self._model = self._credentials.model
+        self._client = create_async_openai_client(self.settings, self._credentials)
+
+        self._fallback_client: AsyncOpenAI | None = None
+        self._fallback_credentials: LlmCredentials | None = None
+        if enable_fallback and provider == "primary":
+            try:
+                self._fallback_credentials = resolve_llm_credentials(
+                    self.settings,
+                    "fallback",
+                    fallback_backend=fallback_backend,
+                )
+                self._fallback_client = create_async_openai_client(
+                    self.settings,
+                    self._fallback_credentials,
+                )
+            except ValueError as exc:
+                logger.warning("Fallback (Ollama/DeepSeek) недоступен: %s", exc)
+
         self._system_prompt = build_system_prompt(self.settings.service_name)
         if provider == "fallback":
             self._system_prompt += (
@@ -68,23 +113,183 @@ class ToolCallClient:
             shablon_path=self.settings.shablon_path,
         )
 
-    def chat(self, user_message: str) -> ChatResult:
+    @property
+    def model(self) -> str:
+        return self._model
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    @property
+    def concurrency(self) -> int:
+        return self._concurrency
+
+    async def aclose(self) -> None:
+        await self._client.close()
+        if self._fallback_client is not None:
+            await self._fallback_client.close()
+
+    async def _create_completion(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        client: AsyncOpenAI | None = None,
+        model: str | None = None,
+        max_tokens: int | None = None,
+        stream: bool = False,
+        stream_options: dict[str, Any] | None = None,
+    ) -> Any:
+        active_client = client or self._client
+        active_model = model or self._model
+        kwargs: dict[str, Any] = {
+            "model": active_model,
+            "messages": messages,
+            "temperature": 0.2,
+            "timeout": self.settings.request_timeout_seconds,
+        }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        if tools is not None:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        if stream:
+            kwargs["stream"] = True
+            if stream_options is not None:
+                kwargs["stream_options"] = stream_options
+        try:
+            return await active_client.chat.completions.create(**kwargs)
+        except Exception:
+            if (
+                client is None
+                and self._fallback_client is not None
+                and self._fallback_credentials is not None
+                and self.provider == "primary"
+                and self._enable_fallback
+            ):
+                return await self._create_completion(
+                    messages=messages,
+                    tools=tools,
+                    client=self._fallback_client,
+                    model=self._fallback_credentials.model,
+                    max_tokens=max_tokens,
+                    stream=stream,
+                    stream_options=stream_options,
+                )
+            raise
+
+    async def complete(self, prompt: str, *, model: str | None = None) -> str:
+        """Один prompt → один ответ (для бенчмарка и простых вызовов)."""
+        async with self._sem:
+            started = time.perf_counter()
+            status = "ok"
+            used_model = model or self._model
+            used_backend = self._backend
+            try:
+                async with asyncio.timeout(self._business_timeout):
+                    response = await self._create_completion(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=used_model,
+                        max_tokens=self._max_tokens,
+                    )
+                    if response.model:
+                        used_model = response.model
+                    return response.choices[0].message.content or ""
+            except Exception:
+                status = "error"
+                raise
+            finally:
+                duration_ms = (time.perf_counter() - started) * 1000
+                logger.info(
+                    "llm.call duration_ms=%.1f model=%s backend=%s prompt_chars=%d status=%s",
+                    duration_ms,
+                    used_model,
+                    used_backend,
+                    len(prompt),
+                    status,
+                )
+
+    async def batch_chat(
+        self,
+        prompts: list[str],
+        concurrency: int | None = None,
+    ) -> list[str | Exception]:
+        if concurrency is not None and concurrency != self._concurrency:
+            logger.warning(
+                "batch_chat concurrency=%d игнорируется: используется self._sem из __init__ (%d)",
+                concurrency,
+                self._concurrency,
+            )
+
+        async def _one(prompt: str) -> str:
+            return await self.complete(prompt)
+
+        return list(await asyncio.gather(*(_one(p) for p in prompts), return_exceptions=True))
+
+    async def batch_chat_strict(
+        self,
+        prompts: list[str],
+        *,
+        models: list[str] | None = None,
+    ) -> list[str]:
+        models = models or [self._model] * len(prompts)
+        if len(models) != len(prompts):
+            raise ValueError("models должен совпадать по длине с prompts")
+
+        results: list[str | None] = [None] * len(prompts)
+
+        async def _task(index: int, prompt: str, model: str) -> None:
+            results[index] = await self.complete(prompt, model=model)
+
+        async with asyncio.TaskGroup() as tg:
+            for index, (prompt, model) in enumerate(zip(prompts, models, strict=True)):
+                tg.create_task(_task(index, prompt, model))
+
+        return [item if item is not None else "" for item in results]
+
+    async def stream_chat(self, prompt: str, *, model: str | None = None) -> AsyncIterator[str]:
+        used_model = model or self._model
+        async with self._sem:
+            async for delta in self._stream_prompt(prompt, used_model):
+                yield delta
+
+    async def _stream_prompt(self, prompt: str, model: str) -> AsyncIterator[str]:
+        stream = await self._create_completion(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            max_tokens=self._max_tokens,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        usage_total: int | None = None
+        async for chunk in stream:
+            if chunk.choices:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+            if chunk.usage is not None:
+                usage_total = chunk.usage.total_tokens
+        logger.info(
+            "llm.stream usage total_tokens=%s model=%s prompt_chars=%d",
+            usage_total,
+            model,
+            len(prompt),
+        )
+
+    async def chat(self, user_message: str) -> ChatResult:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self._system_prompt},
             {"role": "user", "content": user_message},
         ]
         tool_calls_made = 0
+        active_model = self._model
 
         for round_num in range(1, self.settings.max_tool_rounds + 1):
             print(f"  → LLM раунд {round_num}/{self.settings.max_tool_rounds}...", flush=True)
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                tools=self._tools,
-                tool_choice="auto",
-                temperature=0.2,
-                timeout=self.settings.request_timeout_seconds,
-            )
+            response = await self._create_completion(messages=messages, tools=self._tools)
+            if response.model:
+                active_model = response.model
             assistant_message = response.choices[0].message
             tool_calls = list(assistant_message.tool_calls or [])
             parsed_from_text = False
@@ -124,7 +329,7 @@ class ToolCallClient:
 
             if not tool_calls:
                 text = (assistant_message.content or "").strip()
-                return ChatResult(text=text, tool_calls_made=tool_calls_made, model=self._model)
+                return ChatResult(text=text, tool_calls_made=tool_calls_made, model=active_model)
 
             for tool_call in tool_calls:
                 tool_calls_made += 1
@@ -145,41 +350,40 @@ class ToolCallClient:
         return ChatResult(
             text="Не удалось завершить диалог: превышено число раундов tool_call.",
             tool_calls_made=tool_calls_made,
-            model=self._model,
+            model=active_model,
         )
 
-    def chat_json(self, user_message: str) -> dict[str, Any]:
-        result = self.chat(user_message)
+    async def chat_json(self, user_message: str) -> dict[str, Any]:
+        result = await self.chat(user_message)
         return {
             "answer": result.text,
             "tool_calls_made": result.tool_calls_made,
             "model": result.model,
         }
 
-    def chat_sectioned(
+    async def chat_sectioned(
         self,
         user_message: str,
         *,
         feature_name: str | None = None,
         protocol: str | None = None,
     ) -> ChatResult:
-        """Пошаговая генерация: kit-tool → секция → склейка (без одного огромного контекста)."""
         from app.llm.section_orchestrator import SectionOrchestrator
 
-        return SectionOrchestrator(self).generate(
+        return await SectionOrchestrator(self).generate(
             user_message,
             feature_name=feature_name,
             protocol=protocol,
         )
 
-    def chat_sectioned_json(
+    async def chat_sectioned_json(
         self,
         user_message: str,
         *,
         feature_name: str | None = None,
         protocol: str | None = None,
     ) -> dict[str, Any]:
-        result = self.chat_sectioned(
+        result = await self.chat_sectioned(
             user_message,
             feature_name=feature_name,
             protocol=protocol,
@@ -189,3 +393,50 @@ class ToolCallClient:
             "tool_calls_made": result.tool_calls_made,
             "model": result.model,
         }
+
+
+class SyncLLMClient:
+    """Sync baseline для бенчмарка (последовательные вызовы primary OpenAI)."""
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or Settings()
+        creds = resolve_llm_credentials(self.settings, "primary")
+        self._model = creds.model
+        self._max_tokens = self.settings.llm_max_tokens
+        self._client = OpenAI(
+            api_key=creds.api_key,
+            base_url=creds.base_url,
+            timeout=self.settings.llm_sdk_timeout,
+            max_retries=self.settings.llm_max_retries,
+        )
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def complete(self, prompt: str, *, model: str | None = None) -> str:
+        started = time.perf_counter()
+        status = "ok"
+        used_model = model or self._model
+        try:
+            response = self._client.chat.completions.create(
+                model=used_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=self._max_tokens,
+            )
+            return response.choices[0].message.content or ""
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            duration_ms = (time.perf_counter() - started) * 1000
+            logger.info(
+                "llm.call duration_ms=%.1f model=%s backend=primary prompt_chars=%d status=%s",
+                duration_ms,
+                used_model,
+                len(prompt),
+                status,
+            )
+
+    def close(self) -> None:
+        self._client.close()

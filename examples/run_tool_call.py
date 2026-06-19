@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 
 from openai import APITimeoutError
 
 from app.llm import ToolCallClient
-from demo_common import FEATURE_BRIEF, FEATURE_NAME, FEATURE_PROTOCOL, save_answer
+from demo_common import (
+    FEATURE_BRIEF,
+    FEATURE_NAME,
+    FEATURE_PROTOCOL,
+    close_client,
+    ensure_async_tool_call_client,
+    save_answer,
+)
 
 ANSWER_SUFFIX = "openai"
 
 
-def main() -> int:
+async def main() -> int:
+    ensure_async_tool_call_client()
     client = ToolCallClient(provider="primary")
 
     print(f"=== {client.settings.service_name} — документация фичи (sectioned / OpenAI) ===\n")
@@ -25,11 +34,15 @@ def main() -> int:
     )
     print("---")
 
-    result = client.chat_sectioned_json(
-        FEATURE_BRIEF,
-        feature_name=FEATURE_NAME,
-        protocol=FEATURE_PROTOCOL,
-    )
+    try:
+        result = await client.chat_sectioned_json(
+            FEATURE_BRIEF,
+            feature_name=FEATURE_NAME,
+            protocol=FEATURE_PROTOCOL,
+        )
+    finally:
+        await close_client(client)
+
     output_path = save_answer(result, suffix=ANSWER_SUFFIX)
 
     print(f"Tool calls: {result['tool_calls_made']} | Модель: {result['model']}")
@@ -41,7 +54,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(asyncio.run(main()))
     except ValueError as error:
         print(error, file=sys.stderr)
         raise SystemExit(1) from error
