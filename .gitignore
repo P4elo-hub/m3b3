@@ -12,6 +12,13 @@ env/
 
 # Generated media/artifacts
 generated.png
+assistant.log
+
+# Generated example outputs
+examples/answers/*.md
+
+# Legacy
+multimodal_support_assistant_cli/
 
 # OS/editor files
 .DS_Store

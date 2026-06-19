@@ -1,5 +1,0 @@
-openai
-tenacity
-loguru
-redis
-python-dotenv
